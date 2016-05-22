@@ -1,90 +1,110 @@
 package com.github.tbr.dao;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
-import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HTableInterface;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
+import org.apache.hadoop.hbase.client.ResultScanner;
+import org.apache.hadoop.hbase.client.RowMutations;
+import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.util.Bytes;
 
+import com.github.tbr.dao.util.DateUtils;
+
 public class HBaseDao {
-	private HBaseTestingUtility utility;
-	private static final int MAX_ROWS = 10000;
-	private static final int MAX_VERSIONS = 10000;
-	private static final byte[] TABLE_NAME = Bytes.toBytes("test_full_log");
-	private static final byte[] FAMILY = Bytes.toBytes("last");
-	private static final byte[] QUALIFIER = Bytes.toBytes("t");
+	private HTableInterface hTable;
 
-	public HBaseDao() {
-		this.utility = new HBaseTestingUtility();
+	private static final byte[] FIRST_LOG_TIME_FAMILY = Bytes.toBytes("f");
+	private static final byte[] LAST_LOG_TIME_FAMILY = Bytes.toBytes("l");
+
+	public HBaseDao(HTableInterface hTable) {
+		this.hTable = hTable;
 	}
 
-	public void test(int val) throws Exception {
-		startup();
-		doTest(val);
-		shutdown();
+	public boolean updateFirstLogTime(int id, String action, long logTime) throws IOException {
+		byte[] rowKey = rowKey(id, 0L);
+		byte[] family = FIRST_LOG_TIME_FAMILY;
+		byte[] qualifier = Bytes.toBytes(action);
+		byte[] value = Bytes.toBytes(logTime);
+		return update(rowKey, family, qualifier, CompareOp.GREATER, value);
 	}
 
-	private void doTest(int val) {
-		HTableInterface table = null;
+	public boolean updateLastLogTime(int id, String action, long logTime) throws IOException {
+		long week = DateUtils.weekFloorOf(logTime);
+		byte[] rowKey = rowKey(id, week);
+		byte[] family = LAST_LOG_TIME_FAMILY;
+		byte[] qualifier = Bytes.toBytes(action);
+		byte[] value = Bytes.toBytes(logTime);
+		return update(rowKey, family, qualifier, CompareOp.LESS, value);
+	}
+
+	private boolean update(byte[] rowKey, byte[] family, byte[] qualifier, CompareOp compareOp, byte[] value)
+			throws IOException {
 		try {
-			table = utility.createTable(TABLE_NAME, FAMILY, MAX_VERSIONS);
-			byte[] rowKey = Bytes.toBytes(123456L);
-			System.out.println("putting....");
-			List<Put> putList = new ArrayList<Put>(MAX_ROWS);
-			for (int i = 1; i <= MAX_ROWS; i = i + 3) {
-				Put put = new Put(rowKey, i);
-				put.add(FAMILY, QUALIFIER, Bytes.toBytes(i + 2));
-				putList.add(put);
+			Put put = new Put(rowKey);
+			if (!hTable.checkAndPut(rowKey, family, qualifier, value, put)) {
+				RowMutations rowMutations = new RowMutations(rowKey);
+				rowMutations.add(put);
+				return hTable.checkAndMutate(rowKey, family, qualifier, compareOp, value, rowMutations);
 			}
-			table.put(putList);
-			System.out.println("getting...");
-			Get get = new Get(rowKey);
-			get.setTimeRange(0, val);
-			get.setMaxVersions(3);
-			// Note: it is not possible to filter values for multiple versions
-			// get.setFilter(new SingleColumnValueFilter(FAMILY,
-			// QUALIFIER,CompareOp.LESS, Bytes.toBytes(val)));
-			Result result = table.get(get);
-			List<Cell> cells = result.listCells();
-			if (cells != null) {
-				for (Cell cell : result.listCells()) {
-					int actualVal = Bytes.toInt(CellUtil.cloneValue(cell));
-					if (actualVal < val) {
-						System.out.println("value=" + actualVal + ",ts=" + cell.getTimestamp());
-						break;
-					}
-				}
-			}
-		} catch (IOException e) {
-			throw new RuntimeException(e);
+			return false;
 		} finally {
-			if (table != null) {
-				try {
-					table.close();
-				} catch (IOException e) {
-					throw new RuntimeException("Closing table instance failed", e);
-				}
+			if (hTable != null) {
+				hTable.close();
 			}
 		}
 	}
 
-	private void startup() throws Exception {
-		utility.startMiniCluster();
+	private byte[] rowKey(int id, long week) {
+		return Bytes.add(Bytes.toBytes(id), Bytes.toBytes(week));
 	}
 
-	private void shutdown() throws Exception {
-		utility.shutdownMiniCluster();
+	public long getFirstLogTime(int id, String action) throws IOException {
+		try {
+			Get get = new Get(rowKey(id, 0L));
+			List<Cell> cells = hTable.get(get).listCells();
+			return cells == null ? -1 : Bytes.toLong(CellUtil.cloneValue(cells.get(0)));
+		} finally {
+			if (hTable != null) {
+				hTable.close();
+			}
+		}
 	}
 
-	public static void main(String[] args) throws Exception {
-		HBaseDao dao = new HBaseDao();
-		dao.test(10001);
+	public long getLastLogTime(int id, String action, long currentLogTime) throws IOException {
+		byte[] startRow = rowKey(id, 0);
+		byte[] stopRow = rowKey(id, DateUtils.weekCeilingOf(currentLogTime));
+		Scan scan = new Scan();
+		scan.setStartRow(startRow);
+		scan.setStopRow(stopRow);
+		scan.setReversed(false);
+		scan.addColumn(FIRST_LOG_TIME_FAMILY, Bytes.toBytes(action));
+		ResultScanner scanner = null;
+		try {
+			scanner = hTable.getScanner(scan);
+			for (Result rs : scanner) {
+				for (Cell cell : rs.listCells()) {
+					long lastLogTime = Bytes.toLong(CellUtil.cloneValue(cell));
+					if (lastLogTime < currentLogTime) {
+						return lastLogTime;
+					}
+				}
+			}
+		} finally {
+			if (scanner != null) {
+				scanner.close();
+			}
+			if (hTable != null) {
+				hTable.close();
+			}
+		}
+
+		return -1;
 	}
 }
