@@ -46,19 +46,14 @@ public class HBaseDao {
 
 	private boolean update(byte[] rowKey, byte[] family, byte[] qualifier, CompareOp compareOp, byte[] value)
 			throws IOException {
-		try {
-			Put put = new Put(rowKey);
-			if (!hTable.checkAndPut(rowKey, family, qualifier, value, put)) {
-				RowMutations rowMutations = new RowMutations(rowKey);
-				rowMutations.add(put);
-				return hTable.checkAndMutate(rowKey, family, qualifier, compareOp, value, rowMutations);
-			}
-			return false;
-		} finally {
-			if (hTable != null) {
-				hTable.close();
-			}
+		Put put = new Put(rowKey);
+		put.add(family, qualifier, value);
+		if (!hTable.checkAndPut(rowKey, family, qualifier, null, put)) {
+			RowMutations rowMutations = new RowMutations(rowKey);
+			rowMutations.add(put);
+			return hTable.checkAndMutate(rowKey, family, qualifier, compareOp, value, rowMutations);
 		}
+		return true;
 	}
 
 	private byte[] rowKey(int id, long week) {
@@ -66,31 +61,28 @@ public class HBaseDao {
 	}
 
 	public long getFirstLogTime(int id, String action) throws IOException {
-		try {
-			Get get = new Get(rowKey(id, 0L));
-			List<Cell> cells = hTable.get(get).listCells();
-			return cells == null ? -1 : Bytes.toLong(CellUtil.cloneValue(cells.get(0)));
-		} finally {
-			if (hTable != null) {
-				hTable.close();
-			}
-		}
+		Get get = new Get(rowKey(id, 0L));
+		get.addColumn(FIRST_LOG_TIME_FAMILY, Bytes.toBytes(action));
+		List<Cell> cells = hTable.get(get).listCells();
+		return cells == null ? -1 : Bytes.toLong(CellUtil.cloneValue(cells.get(0)));
 	}
 
 	public long getLastLogTime(int id, String action, long currentLogTime) throws IOException {
-		byte[] startRow = rowKey(id, 0);
-		byte[] stopRow = rowKey(id, DateUtils.weekCeilingOf(currentLogTime));
+		byte[] startRow = rowKey(id, DateUtils.weekFloorOf(currentLogTime));
+		byte[] stopRow = rowKey(id, 0);
 		Scan scan = new Scan();
 		scan.setStartRow(startRow);
 		scan.setStopRow(stopRow);
-		scan.setReversed(false);
-		scan.addColumn(FIRST_LOG_TIME_FAMILY, Bytes.toBytes(action));
+		scan.setReversed(true);
+		scan.addColumn(LAST_LOG_TIME_FAMILY, Bytes.toBytes(action));
 		ResultScanner scanner = null;
 		try {
 			scanner = hTable.getScanner(scan);
 			for (Result rs : scanner) {
 				for (Cell cell : rs.listCells()) {
 					long lastLogTime = Bytes.toLong(CellUtil.cloneValue(cell));
+					System.out.println(lastLogTime);
+
 					if (lastLogTime < currentLogTime) {
 						return lastLogTime;
 					}
@@ -100,11 +92,14 @@ public class HBaseDao {
 			if (scanner != null) {
 				scanner.close();
 			}
-			if (hTable != null) {
-				hTable.close();
-			}
 		}
 
 		return -1;
+	}
+
+	public void close() throws IOException {
+		if (hTable != null) {
+			hTable.close();
+		}
 	}
 }
